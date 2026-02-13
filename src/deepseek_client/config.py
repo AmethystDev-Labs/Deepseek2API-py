@@ -77,8 +77,12 @@ class Config:
             return
 
         try:
-            with httpx.Client(timeout=10.0) as client:
-                resp = client.get(rap_url)
+            rap_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "*/*",
+            }
+            with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                resp = client.get(rap_url, headers=rap_headers)
                 resp.raise_for_status()
                 encrypted_content = resp.content
             
