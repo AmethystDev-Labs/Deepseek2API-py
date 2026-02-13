@@ -130,27 +130,61 @@ class AsyncDeepSeekClient:
             return base64.b64encode(resp_str.encode('utf-8')).decode('utf-8')
         return None
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=2, max=10),
-        retry=retry_if_exception_type((httpx.NetworkError, httpx.TimeoutException)),
-        reraise=True
-    )
-    async def create_session(self, headers: dict) -> Optional[str]:
+    async def create_session(self, headers: dict, model: str = "deepseek-chat") -> Optional[str]:
         url = f"{BASE_URL}/chat_session/create"
-        try:
-            resp = await self.client.post(url, json={}, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("code") == 0:
-                return data.get("data", {}).get("biz_data", {}).get("id")
-            return None
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                return "Error: Unauthorized (Invalid Token)"
-            return f"Error: HTTP {e.response.status_code} during session creation"
-        except Exception as e:
-            return f"Error: {str(e)}"
+        
+        # Determine character_id based on model
+        character_id = "v3"
+        if "reasoner" in model.lower() or "r1" in model.lower():
+            character_id = "r1"
+            
+        payload = {
+            "character_id": character_id,
+            "device_id": str(uuid.uuid4())
+        }
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                resp = await self.client.post(url, json=payload, headers=headers, timeout=30.0)
+                
+                # If 202 Accepted, DeepSeek is rate limiting or queuing, wait and retry
+                if resp.status_code == 202:
+                    wait_time = (attempt + 1) * 2
+                    logger.warning(f"DeepSeek returned 202 Accepted (Queued). Body: {resp.text[:200]}. Retrying in {wait_time}s... (Attempt {attempt+1}/{max_retries})")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("code") == 0:
+                    return data.get("data", {}).get("biz_data", {}).get("id")
+                
+                error_msg = data.get("msg") or "Unknown error"
+                logger.error(f"Session creation code error: {data}. Full body: {resp.text}")
+                return f"Error: Session creation failed: {error_msg}"
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to decode session JSON: {str(e)}. Full body: {resp.text}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return "Error: Invalid JSON response from DeepSeek"
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 401:
+                    logger.error(f"Unauthorized (401). Body: {e.response.text}")
+                    return "Error: Unauthorized (Invalid Token)"
+                logger.error(f"HTTP {e.response.status_code} during session creation. Body: {e.response.text}")
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return f"Error: HTTP {e.response.status_code} during session creation"
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    await asyncio.sleep(1)
+                    continue
+                return f"Error: {str(e)}"
+
+        return "Error: Failed to create session after multiple retries (DeepSeek busy/202)"
 
     @retry(
         stop=stop_after_attempt(3),
@@ -173,7 +207,7 @@ class AsyncDeepSeekClient:
         logger.info(f"Starting stream_chat for model: {model}")
         
         try:
-            session_result = await self.create_session(headers)
+            session_result = await self.create_session(headers, model=model)
             if not session_result or session_result.startswith("Error:"):
                 logger.error(f"Session creation failed: {session_result}")
                 yield session_result or "Error: Failed to create session"
@@ -401,7 +435,8 @@ async def chat_completions(
                         content = data["v"]
                     
                     full_text += content
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Non-critical JSON parse error: {str(e)} for line: {line[:50]}")
                     continue
             
             return ChatCompletionResponse(
@@ -414,6 +449,8 @@ async def chat_completions(
                 ]
             )
         except Exception as e:
+            logger.error(f"Non-stream chat execution error: {str(e)}")
+            logger.error(traceback.format_exc())
             raise HTTPException(status_code=500, detail=str(e))
     else:
         # Streaming implementation
