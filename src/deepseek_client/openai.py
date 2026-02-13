@@ -3,6 +3,8 @@ import time
 import uuid
 import asyncio
 import os
+import traceback
+import logging
 from typing import List, Optional, Union, AsyncGenerator, Dict, Any
 from contextlib import asynccontextmanager
 from concurrent.futures import ProcessPoolExecutor
@@ -17,6 +19,13 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import anyio
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("deepseek-proxy")
 
 try:
     from .config import get_config, get_token_manager, build_headers
@@ -161,54 +170,65 @@ class AsyncDeepSeekClient:
 
     async def stream_chat(self, token: str, prompt: str, model: str = "deepseek-chat") -> AsyncGenerator[str, None]:
         headers = build_headers(token)
+        logger.info(f"Starting stream_chat for model: {model}")
         
-        session_result = await self.create_session(headers)
-        if not session_result or session_result.startswith("Error:"):
-            yield session_result or "Error: Failed to create session"
-            return
-        
-        session_id = session_result
+        try:
+            session_result = await self.create_session(headers)
+            if not session_result or session_result.startswith("Error:"):
+                logger.error(f"Session creation failed: {session_result}")
+                yield session_result or "Error: Failed to create session"
+                return
+            
+            session_id = session_result
+            logger.info(f"Session created: {session_id}")
 
-        challenge = await self.get_pow_challenge(headers)
-        if not challenge:
-            yield "Error: Failed to get PoW challenge"
-            return
-
-        pow_response = await self.solve_pow_async(challenge)
-        
-        url = f"{BASE_URL}/chat/completion"
-        req_headers = headers.copy()
-        if pow_response:
-            req_headers["x-ds-pow-response"] = pow_response
-        req_headers["x-hif-leim"] = X_HIF_LEIM
-
-        # Map models to thinking/search flags
-        # deepseek-reasoner -> R1 (thinking enabled)
-        # deepseek-chat -> V3 (thinking disabled)
-        # deepseek-*-search -> Search enabled
-        model_lower = model.lower()
-        thinking_enabled = "reasoner" in model_lower or "r1" in model_lower
-        search_enabled = "search" in model_lower
-
-        payload = {
-            "chat_session_id": session_id,
-            "parent_message_id": None,
-            "prompt": prompt,
-            "ref_file_ids": [],
-            "thinking_enabled": thinking_enabled,
-            "search_enabled": search_enabled,
-            "preempt": False,
-        }
-
-        async with self.client.stream("POST", url, json=payload, headers=req_headers, timeout=60.0) as resp:
-            if resp.status_code != 200:
-                error_text = await resp.aread()
-                yield f"Error: DeepSeek API returned {resp.status_code} - {error_text.decode()}"
+            challenge = await self.get_pow_challenge(headers)
+            if not challenge:
+                logger.error("Failed to get PoW challenge")
+                yield "Error: Failed to get PoW challenge"
                 return
 
-            async for line in resp.aiter_lines():
-                if line:
-                    yield line
+            logger.info("Solving PoW challenge...")
+            pow_response = await self.solve_pow_async(challenge)
+            if not pow_response:
+                logger.warning("PoW solving failed or skipped")
+            else:
+                logger.info("PoW solved successfully")
+            
+            url = f"{BASE_URL}/chat/completion"
+            req_headers = headers.copy()
+            if pow_response:
+                req_headers["x-ds-pow-response"] = pow_response
+            req_headers["x-hif-leim"] = X_HIF_LEIM
+
+            model_lower = model.lower()
+            thinking_enabled = "reasoner" in model_lower or "r1" in model_lower
+            search_enabled = "search" in model_lower
+
+            payload = {
+                "chat_session_id": session_id,
+                "parent_message_id": None,
+                "prompt": prompt,
+                "ref_file_ids": [],
+                "thinking_enabled": thinking_enabled,
+                "search_enabled": search_enabled,
+                "preempt": False,
+            }
+
+            async with self.client.stream("POST", url, json=payload, headers=req_headers, timeout=60.0) as resp:
+                if resp.status_code != 200:
+                    error_text = await resp.aread()
+                    logger.error(f"DeepSeek API error {resp.status_code}: {error_text.decode()}")
+                    yield f"Error: DeepSeek API returned {resp.status_code} - {error_text.decode()}"
+                    return
+
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield line
+        except Exception as e:
+            logger.error(f"Unexpected error in stream_chat: {str(e)}")
+            logger.error(traceback.format_exc())
+            yield f"Error: {str(e)}"
 
 # --- App & Dependencies ---
 
