@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request, HTTPException, Depends, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import anyio
@@ -212,6 +213,21 @@ async def lifespan(app: FastAPI):
             yield
 
 app = FastAPI(title="DeepSeek to OpenAI Proxy", lifespan=lifespan)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=openai_error(str(exc.detail), code=str(exc.status_code))
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=openai_error(str(exc), error_type="validation_error")
+    )
+
 security = HTTPBearer()
 
 def get_proxy_key(auth: HTTPAuthorizationCredentials = Depends(security)):
@@ -227,6 +243,16 @@ def get_proxy_key(auth: HTTPAuthorizationCredentials = Depends(security)):
     )
 
 # --- Endpoints ---
+
+def openai_error(message: str, error_type: str = "invalid_request_error", code: Optional[str] = None):
+    return {
+        "error": {
+            "message": message,
+            "type": error_type,
+            "param": None,
+            "code": code
+        }
+    }
 
 @app.get("/v1/models")
 async def list_models(_key: str = Depends(get_proxy_key)):
@@ -314,7 +340,7 @@ async def chat_completions(
             try:
                 async for line in ds_client.stream_chat(ds_token, prompt, model=request.model):
                     if line.startswith("Error:"):
-                        yield f"data: {json.dumps({'error': line})}\n\n"
+                        yield f"data: {json.dumps(openai_error(line))}\n\n"
                         break
                     
                     try:
