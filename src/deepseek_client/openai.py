@@ -358,12 +358,13 @@ async def chat_completions(
                 # DeepSeek web API returns specific JSON structure
                 content = ""
                 try:
-                    if line.startswith("data: "):
-                        line_data = line[6:]
+                    clean_line = line.strip()
+                    if clean_line.startswith("data: "):
+                        line_data = clean_line[6:]
                     else:
-                        line_data = line
+                        line_data = clean_line
                     
-                    if not line_data.strip():
+                    if not line_data or line_data == "[DONE]":
                         continue
 
                     data = json.loads(line_data)
@@ -407,15 +408,24 @@ async def chat_completions(
                         break
                     
                     try:
-                        if line.startswith("data: "):
-                            line_data = line[6:]
+                        clean_line = line.strip()
+                        if clean_line.startswith("data: "):
+                            line_data = clean_line[6:]
                         else:
-                            line_data = line
+                            line_data = clean_line
                         
-                        if not line_data.strip():
+                        if not line_data or line_data == "[DONE]":
                             continue
 
-                        ds_data = json.loads(line_data)
+                        # Robust JSON parsing
+                        try:
+                            ds_data = json.loads(line_data)
+                        except json.JSONDecodeError:
+                            # If it's not JSON, it might be a raw message or a partial chunk
+                            # Let's log it for debugging and skip to avoid crashing
+                            print(f"DEBUG: Skipping invalid JSON line: {line_data[:100]}...")
+                            continue
+                        
                         content = ""
                         finish_reason = None
 
