@@ -5,6 +5,8 @@ import asyncio
 import os
 from typing import List, Optional, Union, AsyncGenerator, Dict, Any
 from contextlib import asynccontextmanager
+from concurrent.futures import ProcessPoolExecutor
+import multiprocessing
 
 import httpx
 import uvicorn
@@ -24,6 +26,19 @@ except ImportError:
     from config import get_config, get_token_manager, build_headers
     from pow import DeepSeekPoW
     from constants import BASE_URL, X_HIF_LEIM
+
+# Global process pool for PoW calculations
+_process_pool: Optional[ProcessPoolExecutor] = None
+
+def _solve_pow_worker(algorithm: str, challenge: str, salt: str, difficulty: int, expire_at: int) -> Optional[int]:
+    """Worker function that runs in a separate process."""
+    try:
+        # Each process creates its own WASM instance to avoid sharing state
+        solver = DeepSeekPoW()
+        return solver.solve_challenge(algorithm, challenge, salt, difficulty, expire_at)
+    except Exception as e:
+        print(f"Process worker error: {e}")
+        return None
 
 # --- Models ---
 
@@ -67,10 +82,8 @@ class AsyncDeepSeekClient:
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
         self.config = get_config()
-        self.pow_solver = DeepSeekPoW()
-        # Increase semaphore to allow more concurrent PoW calculations
-        # but keep it bounded to avoid CPU exhaustion
-        self.pow_semaphore = asyncio.Semaphore(10) 
+        # No need for a local solver here anymore, we'll use the process pool
+        self.pow_semaphore = asyncio.Semaphore(10) # Safe to increase again with multiprocess
 
     async def solve_pow_async(self, challenge_data: dict) -> Optional[str]:
         biz_data = challenge_data.get("data", {}).get("biz_data", {}).get("challenge", {})
@@ -86,9 +99,11 @@ class AsyncDeepSeekClient:
             return None
 
         async with self.pow_semaphore:
-            # Run CPU-bound task in thread pool
-            answer = await anyio.to_thread.run_sync(
-                self.pow_solver.solve_challenge, 
+            loop = asyncio.get_running_loop()
+            # Run the CPU-bound task in a separate process
+            answer = await loop.run_in_executor(
+                _process_pool,
+                _solve_pow_worker,
                 algorithm, challenge, salt, difficulty, expire_at
             )
 
@@ -213,6 +228,12 @@ async def rap_fetch_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _process_pool
+    # Initialize process pool for PoW
+    # Use 2-4 workers depending on CPU to keep it responsive
+    worker_count = min(os.cpu_count() or 1, 4)
+    _process_pool = ProcessPoolExecutor(max_workers=worker_count)
+    
     # Initialize global HTTP client with optimized pool settings
     limits = httpx.Limits(
         max_connections=200,          # Increase total connections
@@ -241,6 +262,10 @@ async def lifespan(app: FastAPI):
                     pass
         else:
             yield
+    
+    # Shutdown process pool
+    if _process_pool:
+        _process_pool.shutdown(wait=True)
 
 app = FastAPI(title="DeepSeek to OpenAI Proxy", lifespan=lifespan)
 
@@ -440,12 +465,10 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     config = get_config()
-    # Optimized uvicorn settings for high load
+    # High-performance settings but avoiding some experimental flags that might cause instability
     uvicorn.run(
         app, 
         host=config.host, 
         port=config.port,
-        loop="uvloop",      # Use uvloop for faster event loop if available
-        http="httptools",   # Use httptools for faster HTTP parsing
-        workers=1           # Keep 1 worker for shared state, but it handles async better
+        workers=1           # Must be 1 to maintain Wasmtime safety and shared state
     )
