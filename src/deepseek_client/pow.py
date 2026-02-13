@@ -14,7 +14,13 @@ def resolve_wasm_path() -> str:
                 return str(p)
     except Exception:
         pass
-    # Fallback to project root
+    # Fallback to local assets directory
+    base_dir = os.path.dirname(__file__)
+    assets_path = os.path.join(base_dir, "assets", ASSET_WASM_NAME)
+    if os.path.exists(assets_path):
+        return assets_path
+    
+    # Fallback to project root (deprecated)
     root_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), ASSET_WASM_NAME)
     return root_path
 

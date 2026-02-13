@@ -11,7 +11,7 @@ def main():
     if not token:
         print("Warning: DEEPSEEK_AUTH_TOKEN is not set. Proceeding anyway.")
     with requests.Session(impersonate="chrome120") as session:
-        session.headers.update(build_headers())
+        session.headers.update(build_headers(token))
         session_info = create_session(session)
         if not session_info:
             print("Failed to create session.")

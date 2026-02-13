@@ -2,10 +2,12 @@ import json
 import time
 import uuid
 import asyncio
+import os
 from typing import List, Optional, Union, AsyncGenerator, Dict, Any
 from contextlib import asynccontextmanager
 
 import httpx
+import uvicorn
 from fastapi import FastAPI, Request, HTTPException, Depends, status
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -14,9 +16,14 @@ from pydantic import BaseModel, Field
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import anyio
 
-from .config import get_config, get_token_manager, build_headers
-from .pow import DeepSeekPoW
-from .constants import BASE_URL, X_HIF_LEIM
+try:
+    from .config import get_config, get_token_manager, build_headers
+    from .pow import DeepSeekPoW
+    from .constants import BASE_URL, X_HIF_LEIM
+except ImportError:
+    from config import get_config, get_token_manager, build_headers
+    from pow import DeepSeekPoW
+    from constants import BASE_URL, X_HIF_LEIM
 
 # --- Models ---
 
@@ -105,12 +112,19 @@ class AsyncDeepSeekClient:
     )
     async def create_session(self, headers: dict) -> Optional[str]:
         url = f"{BASE_URL}/chat_session/create"
-        resp = await self.client.post(url, json={}, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        if data.get("code") == 0:
-            return data.get("data", {}).get("biz_data", {}).get("id")
-        return None
+        try:
+            resp = await self.client.post(url, json={}, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("code") == 0:
+                return data.get("data", {}).get("biz_data", {}).get("id")
+            return None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 401:
+                return "Error: Unauthorized (Invalid Token)"
+            return f"Error: HTTP {e.response.status_code} during session creation"
+        except Exception as e:
+            return f"Error: {str(e)}"
 
     @retry(
         stop=stop_after_attempt(3),
@@ -121,17 +135,22 @@ class AsyncDeepSeekClient:
     async def get_pow_challenge(self, headers: dict) -> Optional[dict]:
         url = f"{BASE_URL}/chat/create_pow_challenge"
         data = {"target_path": "/api/v0/chat/completion"}
-        resp = await self.client.post(url, json=data, headers=headers)
-        resp.raise_for_status()
-        return resp.json()
+        try:
+            resp = await self.client.post(url, json=data, headers=headers)
+            resp.raise_for_status()
+            return resp.json()
+        except Exception:
+            return None
 
     async def stream_chat(self, token: str, prompt: str, model: str = "deepseek-chat") -> AsyncGenerator[str, None]:
         headers = build_headers(token)
         
-        session_id = await self.create_session(headers)
-        if not session_id:
-            yield "Error: Failed to create session"
+        session_result = await self.create_session(headers)
+        if not session_result or session_result.startswith("Error:"):
+            yield session_result or "Error: Failed to create session"
             return
+        
+        session_id = session_result
 
         challenge = await self.get_pow_challenge(headers)
         if not challenge:
@@ -279,9 +298,17 @@ async def chat_completions(
     if not ds_token:
         raise HTTPException(status_code=500, detail="No DeepSeek tokens available")
 
-    # Simple prompt extraction: use the last message's content
-    # For a better converter, we could join messages with roles.
-    prompt = request.messages[-1].content
+    # Convert messages to formatted prompt with <ROLE> tags
+    formatted_prompt = ""
+    for msg in request.messages:
+        role_tag = msg.role.capitalize()
+        formatted_prompt += f"<{role_tag}>\n{msg.content}\n</{role_tag}>\n"
+    
+    # If last message is user, we want assistant to respond
+    if request.messages and request.messages[-1].role == "user":
+        formatted_prompt += "<Assistant>\n"
+    
+    prompt = formatted_prompt.strip()
     ds_client: AsyncDeepSeekClient = app.state.ds_client
 
     if not request.stream:

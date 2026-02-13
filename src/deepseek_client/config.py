@@ -130,6 +130,10 @@ def get_token_manager() -> TokenManager:
         _token_manager_instance = TokenManager(config.tokens)
     return _token_manager_instance
 
+def get_auth_token() -> Optional[str]:
+    """Helper for legacy CLI usage."""
+    return get_token_manager().get_next_token()
+
 def build_headers(token: Optional[str] = None) -> dict:
     headers = DEFAULT_HEADERS.copy()
     if token:
