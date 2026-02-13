@@ -1,0 +1,20 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# IDE and tool specific directories
+.claude/
+.trae/
+
+# Sensitive and data files
+config.json
+rap_data.bin
+*.bin
+tests/response_stream.txt

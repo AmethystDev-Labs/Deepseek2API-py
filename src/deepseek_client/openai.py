@@ -1,0 +1,346 @@
+import json
+import time
+import uuid
+import asyncio
+from typing import List, Optional, Union, AsyncGenerator, Dict, Any
+from contextlib import asynccontextmanager
+
+import httpx
+from fastapi import FastAPI, Request, HTTPException, Depends, status
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import anyio
+
+from .config import get_config, get_token_manager, build_headers
+from .pow import DeepSeekPoW
+from .constants import BASE_URL, X_HIF_LEIM
+
+# --- Models ---
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "deepseek-chat"
+    messages: List[ChatMessage]
+    stream: bool = False
+    temperature: Optional[float] = 0.7
+    max_tokens: Optional[int] = None
+
+class ChatCompletionResponseChoice(BaseModel):
+    index: int
+    message: ChatMessage
+    finish_reason: Optional[str] = "stop"
+
+class ChatCompletionResponse(BaseModel):
+    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4()}")
+    object: str = "chat.completion"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    model: str
+    choices: List[ChatCompletionResponseChoice]
+    usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+
+# --- Client ---
+
+class AsyncDeepSeekClient:
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+        self.config = get_config()
+        self.pow_solver = DeepSeekPoW()
+        self.pow_semaphore = asyncio.Semaphore(self.config.max_pow_concurrency)
+
+    async def solve_pow_async(self, challenge_data: dict) -> Optional[str]:
+        biz_data = challenge_data.get("data", {}).get("biz_data", {}).get("challenge", {})
+        algorithm = biz_data.get("algorithm")
+        challenge = biz_data.get("challenge")
+        salt = biz_data.get("salt")
+        difficulty = biz_data.get("difficulty")
+        expire_at = biz_data.get("expire_at")
+        signature = biz_data.get("signature")
+        target_path = biz_data.get("target_path")
+
+        if algorithm != "DeepSeekHashV1":
+            return None
+
+        async with self.pow_semaphore:
+            # Run CPU-bound task in thread pool
+            answer = await anyio.to_thread.run_sync(
+                self.pow_solver.solve_challenge, 
+                algorithm, challenge, salt, difficulty, expire_at
+            )
+
+        if answer is not None:
+            import base64
+            resp_obj = {
+                "algorithm": algorithm,
+                "challenge": challenge,
+                "salt": salt,
+                "answer": answer,
+                "signature": signature,
+                "target_path": target_path
+            }
+            resp_str = json.dumps(resp_obj)
+            return base64.b64encode(resp_str.encode('utf-8')).decode('utf-8')
+        return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.NetworkError, httpx.TimeoutException)),
+        reraise=True
+    )
+    async def create_session(self, headers: dict) -> Optional[str]:
+        url = f"{BASE_URL}/chat_session/create"
+        resp = await self.client.post(url, json={}, headers=headers)
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("code") == 0:
+            return data.get("data", {}).get("biz_data", {}).get("id")
+        return None
+
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.NetworkError, httpx.TimeoutException)),
+        reraise=True
+    )
+    async def get_pow_challenge(self, headers: dict) -> Optional[dict]:
+        url = f"{BASE_URL}/chat/create_pow_challenge"
+        data = {"target_path": "/api/v0/chat/completion"}
+        resp = await self.client.post(url, json=data, headers=headers)
+        resp.raise_for_status()
+        return resp.json()
+
+    async def stream_chat(self, token: str, prompt: str) -> AsyncGenerator[str, None]:
+        headers = build_headers(token)
+        
+        session_id = await self.create_session(headers)
+        if not session_id:
+            yield "Error: Failed to create session"
+            return
+
+        challenge = await self.get_pow_challenge(headers)
+        if not challenge:
+            yield "Error: Failed to get PoW challenge"
+            return
+
+        pow_response = await self.solve_pow_async(challenge)
+        
+        url = f"{BASE_URL}/chat/completion"
+        req_headers = headers.copy()
+        if pow_response:
+            req_headers["x-ds-pow-response"] = pow_response
+        req_headers["x-hif-leim"] = X_HIF_LEIM
+
+        payload = {
+            "chat_session_id": session_id,
+            "parent_message_id": None,
+            "prompt": prompt,
+            "ref_file_ids": [],
+            "thinking_enabled": False,
+            "search_enabled": False,
+            "preempt": False,
+        }
+
+        async with self.client.stream("POST", url, json=payload, headers=req_headers, timeout=60.0) as resp:
+            if resp.status_code != 200:
+                error_text = await resp.aread()
+                yield f"Error: DeepSeek API returned {resp.status_code} - {error_text.decode()}"
+                return
+
+            async for line in resp.aiter_lines():
+                if line:
+                    yield line
+
+# --- App & Dependencies ---
+
+async def rap_fetch_loop():
+    config = get_config()
+    while True:
+        try:
+            await asyncio.sleep(config.rap_update_time * 60)
+            print(f"Periodic RAP update triggered (every {config.rap_update_time} min)...")
+            # Run sync load in thread to avoid blocking event loop
+            await anyio.to_thread.run_sync(config.load)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Error in RAP fetch loop: {e}")
+            await asyncio.sleep(60) # Wait a bit before retrying on error
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Initialize global HTTP client
+    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
+    async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
+        app.state.ds_client = AsyncDeepSeekClient(client)
+        
+        config = get_config()
+        if config.rap_update_time > 0:
+            print(f"Starting RAP fetch loop (interval: {config.rap_update_time} min)")
+            update_task = asyncio.create_task(rap_fetch_loop())
+            try:
+                yield
+            finally:
+                update_task.cancel()
+                try:
+                    await update_task
+                except asyncio.CancelledError:
+                    pass
+        else:
+            yield
+
+app = FastAPI(title="DeepSeek to OpenAI Proxy", lifespan=lifespan)
+security = HTTPBearer()
+
+def get_proxy_key(auth: HTTPAuthorizationCredentials = Depends(security)):
+    config = get_config()
+    if not config.keys: # No keys defined, allow all
+        return auth.credentials
+    if auth.credentials in config.keys:
+        return auth.credentials
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid proxy key",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+# --- Endpoints ---
+
+@app.post("/v1/chat/completions")
+async def chat_completions(
+    request: ChatCompletionRequest,
+    _key: str = Depends(get_proxy_key)
+):
+    token_manager = get_token_manager()
+    ds_token = token_manager.get_next_token()
+    if not ds_token:
+        raise HTTPException(status_code=500, detail="No DeepSeek tokens available")
+
+    # Simple prompt extraction: use the last message's content
+    # For a better converter, we could join messages with roles.
+    prompt = request.messages[-1].content
+    ds_client: AsyncDeepSeekClient = app.state.ds_client
+
+    if not request.stream:
+        # Non-streaming implementation
+        full_text = ""
+        try:
+            async for line in ds_client.stream_chat(ds_token, prompt):
+                if line.startswith("Error:"):
+                    raise HTTPException(status_code=500, detail=line)
+                
+                # DeepSeek web API returns specific JSON structure
+                content = ""
+                try:
+                    if line.startswith("data: "):
+                        line_data = line[6:]
+                    else:
+                        line_data = line
+                    
+                    if not line_data.strip():
+                        continue
+
+                    data = json.loads(line_data)
+                    # Case 1: Initial fragment block
+                    if isinstance(data.get("v"), dict):
+                        fragments = data["v"].get("response", {}).get("fragments", [])
+                        if fragments:
+                            content = fragments[0].get("content", "")
+                    # Case 2: Append operation
+                    elif data.get("p") and data.get("o") == "APPEND" and "v" in data:
+                        content = data["v"]
+                    # Case 3: Direct value string (only if not a control message with 'p')
+                    elif "v" in data and isinstance(data["v"], str) and "p" not in data:
+                        content = data["v"]
+                    
+                    full_text += content
+                except json.JSONDecodeError:
+                    continue
+            
+            return ChatCompletionResponse(
+                model=request.model,
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content=full_text)
+                    )
+                ]
+            )
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    else:
+        # Streaming implementation
+        async def response_generator():
+            request_id = f"chatcmpl-{uuid.uuid4()}"
+            created_time = int(time.time())
+            
+            try:
+                async for line in ds_client.stream_chat(ds_token, prompt):
+                    if line.startswith("Error:"):
+                        yield f"data: {json.dumps({'error': line})}\n\n"
+                        break
+                    
+                    try:
+                        if line.startswith("data: "):
+                            line_data = line[6:]
+                        else:
+                            line_data = line
+                        
+                        if not line_data.strip():
+                            continue
+
+                        ds_data = json.loads(line_data)
+                        content = ""
+                        finish_reason = None
+
+                        # Case 1: Initial fragment block
+                        if isinstance(ds_data.get("v"), dict):
+                            fragments = ds_data["v"].get("response", {}).get("fragments", [])
+                            if fragments:
+                                content = fragments[0].get("content", "")
+                        # Case 2: Append operation
+                        elif ds_data.get("p") and ds_data.get("o") == "APPEND" and "v" in ds_data:
+                            content = ds_data["v"]
+                        # Case 3: Direct value string (only if not a control message with 'p')
+                        elif "v" in ds_data and isinstance(ds_data["v"], str) and "p" not in ds_data:
+                            content = ds_data["v"]
+                        
+                        # Check for finish reason
+                        if ds_data.get("p") == "response/status" and ds_data.get("v") == "FINISHED":
+                            finish_reason = "stop"
+
+                        if content or finish_reason:
+                            chunk = {
+                                "id": request_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_time,
+                                "model": request.model,
+                                "choices": [
+                                    {
+                                        "index": 0,
+                                        "delta": {"content": content} if content else {},
+                                        "finish_reason": finish_reason
+                                    }
+                                ]
+                            }
+                            yield f"data: {json.dumps(chunk)}\n\n"
+                    except json.JSONDecodeError:
+                        continue
+                yield "data: [DONE]\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
+        return StreamingResponse(response_generator(), media_type="text/event-stream")
+
+@app.get("/health")
+async def health():
+    return {"status": "healthy"}
+
+if __name__ == "__main__":
+    import uvicorn
+    config = get_config()
+    uvicorn.run(app, host=config.host, port=config.port)

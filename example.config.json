@@ -1,0 +1,13 @@
+{
+  "tokens": [
+    "YOUR_DEEPSEEK_AUTH_TOKEN_HERE"
+  ],
+  "keys": [
+    "sk-your-custom-proxy-key-here"
+  ],
+  "retry_times": 3,
+  "max_pow_concurrency": 2,
+  "port": 8000,
+  "host": "0.0.0.0",
+  "rap_update_time": 0
+}
