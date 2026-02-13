@@ -43,6 +43,16 @@ class ChatCompletionResponse(BaseModel):
     choices: List[ChatCompletionResponseChoice]
     usage: Dict[str, int] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
 
+class ModelResponse(BaseModel):
+    id: str
+    object: str = "model"
+    created: int = Field(default_factory=lambda: int(time.time()))
+    owned_by: str = "deepseek"
+
+class ModelListResponse(BaseModel):
+    object: str = "list"
+    data: List[ModelResponse]
+
 # --- Client ---
 
 class AsyncDeepSeekClient:
@@ -114,7 +124,7 @@ class AsyncDeepSeekClient:
         resp.raise_for_status()
         return resp.json()
 
-    async def stream_chat(self, token: str, prompt: str) -> AsyncGenerator[str, None]:
+    async def stream_chat(self, token: str, prompt: str, model: str = "deepseek-chat") -> AsyncGenerator[str, None]:
         headers = build_headers(token)
         
         session_id = await self.create_session(headers)
@@ -135,13 +145,21 @@ class AsyncDeepSeekClient:
             req_headers["x-ds-pow-response"] = pow_response
         req_headers["x-hif-leim"] = X_HIF_LEIM
 
+        # Map models to thinking/search flags
+        # deepseek-reasoner -> R1 (thinking enabled)
+        # deepseek-chat -> V3 (thinking disabled)
+        # deepseek-*-search -> Search enabled
+        model_lower = model.lower()
+        thinking_enabled = "reasoner" in model_lower or "r1" in model_lower
+        search_enabled = "search" in model_lower
+
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": None,
             "prompt": prompt,
             "ref_file_ids": [],
-            "thinking_enabled": False,
-            "search_enabled": False,
+            "thinking_enabled": thinking_enabled,
+            "search_enabled": search_enabled,
             "preempt": False,
         }
 
@@ -210,6 +228,21 @@ def get_proxy_key(auth: HTTPAuthorizationCredentials = Depends(security)):
 
 # --- Endpoints ---
 
+@app.get("/v1/models")
+async def list_models(_key: str = Depends(get_proxy_key)):
+    models = [
+        "deepseek-chat",
+        "deepseek-chat-search",
+        "deepseek-reasoner",
+        "deepseek-reasoner-search",
+        "deepseek-r1",
+        "deepseek-r1-search",
+        "deepseek-search"
+    ]
+    return ModelListResponse(
+        data=[ModelResponse(id=m) for m in models]
+    )
+
 @app.post("/v1/chat/completions")
 async def chat_completions(
     request: ChatCompletionRequest,
@@ -229,7 +262,7 @@ async def chat_completions(
         # Non-streaming implementation
         full_text = ""
         try:
-            async for line in ds_client.stream_chat(ds_token, prompt):
+            async for line in ds_client.stream_chat(ds_token, prompt, model=request.model):
                 if line.startswith("Error:"):
                     raise HTTPException(status_code=500, detail=line)
                 
@@ -279,7 +312,7 @@ async def chat_completions(
             created_time = int(time.time())
             
             try:
-                async for line in ds_client.stream_chat(ds_token, prompt):
+                async for line in ds_client.stream_chat(ds_token, prompt, model=request.model):
                     if line.startswith("Error:"):
                         yield f"data: {json.dumps({'error': line})}\n\n"
                         break
