@@ -68,7 +68,9 @@ class AsyncDeepSeekClient:
         self.client = client
         self.config = get_config()
         self.pow_solver = DeepSeekPoW()
-        self.pow_semaphore = asyncio.Semaphore(self.config.max_pow_concurrency)
+        # Increase semaphore to allow more concurrent PoW calculations
+        # but keep it bounded to avoid CPU exhaustion
+        self.pow_semaphore = asyncio.Semaphore(10) 
 
     async def solve_pow_async(self, challenge_data: dict) -> Optional[str]:
         biz_data = challenge_data.get("data", {}).get("biz_data", {}).get("challenge", {})
@@ -211,9 +213,18 @@ async def rap_fetch_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize global HTTP client
-    limits = httpx.Limits(max_connections=100, max_keepalive_connections=20)
-    async with httpx.AsyncClient(timeout=30.0, limits=limits) as client:
+    # Initialize global HTTP client with optimized pool settings
+    limits = httpx.Limits(
+        max_connections=200,          # Increase total connections
+        max_keepalive_connections=50, # Increase keepalive connections
+        keepalive_expiry=30.0         # 30s keepalive
+    )
+    # Use a faster, more robust async client
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(60.0, connect=10.0), 
+        limits=limits,
+        follow_redirects=True
+    ) as client:
         app.state.ds_client = AsyncDeepSeekClient(client)
         
         config = get_config()
@@ -429,4 +440,12 @@ async def health():
 if __name__ == "__main__":
     import uvicorn
     config = get_config()
-    uvicorn.run(app, host=config.host, port=config.port)
+    # Optimized uvicorn settings for high load
+    uvicorn.run(
+        app, 
+        host=config.host, 
+        port=config.port,
+        loop="uvloop",      # Use uvloop for faster event loop if available
+        http="httptools",   # Use httptools for faster HTTP parsing
+        workers=1           # Keep 1 worker for shared state, but it handles async better
+    )
